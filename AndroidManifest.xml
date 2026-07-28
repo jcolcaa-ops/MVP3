@@ -1,0 +1,116 @@
+package com.jorge.registrollamadas;
+
+import android.Manifest;
+import android.app.Notification;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
+import android.app.PendingIntent;
+import android.app.Service;
+import android.content.Context;
+import android.content.Intent;
+import android.content.SharedPreferences;
+import android.content.pm.PackageManager;
+import android.location.Location;
+import android.location.LocationListener;
+import android.location.LocationManager;
+import android.os.Build;
+import android.os.Bundle;
+import android.os.IBinder;
+
+public class LocationTrackingService extends Service implements LocationListener {
+    private static final String CHANNEL_ID = "registro_llamadas_location";
+    private static final int NOTIFICATION_ID = 7711;
+    private LocationManager locationManager;
+
+    @Override
+    public void onCreate() {
+        super.onCreate();
+        createChannel();
+    }
+
+    @Override
+    public int onStartCommand(Intent intent, int flags, int startId) {
+        SharedPreferences prefs = getSharedPreferences(AppConfig.PREFS, MODE_PRIVATE);
+        if (!prefs.getBoolean(AppConfig.KEY_ENABLED, false)) {
+            stopSelf();
+            return START_NOT_STICKY;
+        }
+        startForeground(NOTIFICATION_ID, createNotification());
+        startLocationUpdates();
+        return START_STICKY;
+    }
+
+    private void startLocationUpdates() {
+        if (Build.VERSION.SDK_INT >= 23 &&
+                checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED &&
+                checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+            return;
+        }
+        locationManager = (LocationManager) getSystemService(Context.LOCATION_SERVICE);
+        if (locationManager == null) return;
+        try {
+            locationManager.requestLocationUpdates(LocationManager.GPS_PROVIDER, 60000L, 50f, this);
+        } catch (Exception ignored) {}
+        try {
+            locationManager.requestLocationUpdates(LocationManager.NETWORK_PROVIDER, 60000L, 50f, this);
+        } catch (Exception ignored) {}
+        try {
+            Location best = locationManager.getLastKnownLocation(LocationManager.GPS_PROVIDER);
+            if (best == null) best = locationManager.getLastKnownLocation(LocationManager.NETWORK_PROVIDER);
+            if (best != null) saveLocation(best);
+        } catch (Exception ignored) {}
+    }
+
+    @Override
+    public void onLocationChanged(Location location) {
+        saveLocation(location);
+    }
+
+    private void saveLocation(Location location) {
+        getSharedPreferences(AppConfig.PREFS, MODE_PRIVATE).edit()
+                .putLong(AppConfig.KEY_LAT, Double.doubleToRawLongBits(location.getLatitude()))
+                .putLong(AppConfig.KEY_LON, Double.doubleToRawLongBits(location.getLongitude()))
+                .putFloat(AppConfig.KEY_ACCURACY, location.hasAccuracy() ? location.getAccuracy() : 0f)
+                .putLong(AppConfig.KEY_LOCATION_TIME, location.getTime() > 0 ? location.getTime() : System.currentTimeMillis())
+                .apply();
+    }
+
+    private Notification createNotification() {
+        Intent openIntent = new Intent(this, MainActivity.class);
+        PendingIntent pendingIntent = PendingIntent.getActivity(
+                this, 0, openIntent, PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+        Notification.Builder builder = Build.VERSION.SDK_INT >= 26
+                ? new Notification.Builder(this, CHANNEL_ID)
+                : new Notification.Builder(this);
+        return builder
+                .setContentTitle("Registro de llamadas activado")
+                .setContentText("Captura llamadas y una coordenada reciente con autorización visible")
+                .setSmallIcon(android.R.drawable.stat_sys_phone_call)
+                .setContentIntent(pendingIntent)
+                .setOngoing(true)
+                .build();
+    }
+
+    private void createChannel() {
+        if (Build.VERSION.SDK_INT >= 26) {
+            NotificationChannel channel = new NotificationChannel(
+                    CHANNEL_ID, "Registro de llamadas y ubicación", NotificationManager.IMPORTANCE_LOW);
+            channel.setDescription("Aviso visible mientras el registro automático está activo");
+            NotificationManager manager = getSystemService(NotificationManager.class);
+            if (manager != null) manager.createNotificationChannel(channel);
+        }
+    }
+
+    @Override
+    public void onDestroy() {
+        if (locationManager != null) {
+            try { locationManager.removeUpdates(this); } catch (Exception ignored) {}
+        }
+        super.onDestroy();
+    }
+
+    @Override public void onStatusChanged(String provider, int status, Bundle extras) {}
+    @Override public void onProviderEnabled(String provider) {}
+    @Override public void onProviderDisabled(String provider) {}
+    @Override public IBinder onBind(Intent intent) { return null; }
+}

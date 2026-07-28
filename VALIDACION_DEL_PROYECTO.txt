@@ -1,0 +1,298 @@
+package com.jorge.registrollamadas;
+
+import android.Manifest;
+import android.app.Activity;
+import android.content.Context;
+import android.content.Intent;
+import android.content.SharedPreferences;
+import android.content.pm.PackageManager;
+import android.graphics.Typeface;
+import android.net.Uri;
+import android.os.Build;
+import android.os.Bundle;
+import android.provider.Settings;
+import android.text.InputType;
+import android.view.View;
+import android.widget.Button;
+import android.widget.CheckBox;
+import android.widget.EditText;
+import android.widget.LinearLayout;
+import android.widget.ScrollView;
+import android.widget.TextView;
+import android.widget.Toast;
+
+import java.util.ArrayList;
+import java.util.List;
+
+public class MainActivity extends Activity {
+    private static final int REQ_PERMISSIONS = 5001;
+
+    private SharedPreferences prefs;
+    private EditText userId;
+    private EditText userName;
+    private EditText phone;
+    private EditText orderId;
+    private CheckBox consent;
+    private Button toggleButton;
+    private TextView status;
+    private boolean enableAfterPermission = false;
+
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        prefs = getSharedPreferences(AppConfig.PREFS, MODE_PRIVATE);
+        setContentView(buildUi());
+        loadValues();
+        if (prefs.getBoolean(AppConfig.KEY_ENABLED, false) && hasLocationPermission()) {
+            startVisibleLocationService();
+        }
+        refreshStatus();
+    }
+
+    private View buildUi() {
+        ScrollView scroll = new ScrollView(this);
+        LinearLayout root = new LinearLayout(this);
+        root.setOrientation(LinearLayout.VERTICAL);
+        root.setPadding(dp(20), dp(20), dp(20), dp(32));
+        scroll.addView(root);
+
+        TextView title = text("Registro de llamadas Delivery", 25, true);
+        root.addView(title);
+
+        TextView disclosure = text(
+                "Esta aplicación lee el historial telefónico después de cada llamada, calcula la duración e intentos y envía esos datos a tu Google Sheet. " +
+                "La ubicación solo se toma mientras la notificación permanente está visible. No graba audio ni el contenido de la conversación.",
+                15, false);
+        disclosure.setPadding(0, dp(12), 0, dp(16));
+        root.addView(disclosure);
+
+        userId = field("ID de usuario, ejemplo USR001", false);
+        userName = field("Nombre del usuario", false);
+        phone = field("Número del cliente", true);
+        orderId = field("ID del pedido (opcional)", false);
+        root.addView(label("Configuración"));
+        root.addView(userId);
+        root.addView(userName);
+        root.addView(phone);
+        root.addView(orderId);
+
+        consent = new CheckBox(this);
+        consent.setText("Confirmo que usaré esta app en mi propio teléfono o con autorización informada del usuario.");
+        consent.setTextSize(14);
+        consent.setPadding(0, dp(10), 0, dp(10));
+        root.addView(consent);
+
+        toggleButton = button("Activar registro automático");
+        toggleButton.setOnClickListener(v -> toggleMonitoring());
+        root.addView(toggleButton);
+
+        Button callButton = button("Abrir llamada y vincular pedido");
+        callButton.setOnClickListener(v -> openDialer());
+        root.addView(callButton);
+
+        Button syncButton = button("Sincronizar pendientes ahora");
+        syncButton.setOnClickListener(v -> syncNow());
+        root.addView(syncButton);
+
+        Button pingButton = button("Probar conexión con Google Sheets");
+        pingButton.setOnClickListener(v -> testApi());
+        root.addView(pingButton);
+
+        Button settingsButton = button("Abrir permisos de la aplicación");
+        settingsButton.setOnClickListener(v -> openAppSettings());
+        root.addView(settingsButton);
+
+        status = text("", 14, false);
+        status.setPadding(0, dp(18), 0, 0);
+        root.addView(status);
+        return scroll;
+    }
+
+    private void toggleMonitoring() {
+        boolean enabled = prefs.getBoolean(AppConfig.KEY_ENABLED, false);
+        if (enabled) {
+            prefs.edit().putBoolean(AppConfig.KEY_ENABLED, false).apply();
+            stopService(new Intent(this, LocationTrackingService.class));
+            refreshStatus();
+            return;
+        }
+
+        saveIdentity();
+        if (userId.getText().toString().trim().isEmpty() || userName.getText().toString().trim().isEmpty()) {
+            toast("Completa el ID y el nombre del usuario.");
+            return;
+        }
+        if (!consent.isChecked()) {
+            toast("Debes confirmar la autorización antes de activar el registro.");
+            return;
+        }
+        if (!hasRequiredPermissions()) {
+            enableAfterPermission = true;
+            requestRequiredPermissions();
+            return;
+        }
+        enableMonitoring();
+    }
+
+    private void enableMonitoring() {
+        long now = System.currentTimeMillis();
+        prefs.edit()
+                .putBoolean(AppConfig.KEY_ENABLED, true)
+                .putLong(AppConfig.KEY_MONITOR_START, now)
+                .putLong(AppConfig.KEY_LAST_PROCESSED, now)
+                .apply();
+        startVisibleLocationService();
+        refreshStatus();
+        toast("Registro activado. La notificación debe permanecer visible.");
+    }
+
+    private void openDialer() {
+        saveIdentity();
+        String number = CallLogProcessor.normalizePhone(phone.getText().toString());
+        if ("DESCONOCIDO".equals(number)) {
+            toast("Ingresa un número válido.");
+            return;
+        }
+        prefs.edit()
+                .putString(AppConfig.KEY_PENDING_NUMBER, number)
+                .putString(AppConfig.KEY_PENDING_ORDER, orderId.getText().toString().trim())
+                .putLong(AppConfig.KEY_PENDING_TIME, System.currentTimeMillis())
+                .apply();
+        Intent intent = new Intent(Intent.ACTION_DIAL, Uri.parse("tel:" + Uri.encode(number)));
+        startActivity(intent);
+    }
+
+    private void saveIdentity() {
+        prefs.edit()
+                .putString(AppConfig.KEY_USER_ID, userId.getText().toString().trim())
+                .putString(AppConfig.KEY_USER_NAME, userName.getText().toString().trim())
+                .apply();
+    }
+
+    private void syncNow() {
+        status.setText("Procesando llamadas nuevas y sincronizando...");
+        new Thread(() -> {
+            int captured = CallLogProcessor.processNewCalls(getApplicationContext());
+            int synced = SyncManager.syncPending(getApplicationContext());
+            runOnUiThread(() -> {
+                refreshStatus();
+                toast("Nuevas: " + captured + " | Sincronizadas: " + synced);
+            });
+        }, "manual-sync").start();
+    }
+
+    private void testApi() {
+        status.setText("Probando endpoint...");
+        new Thread(() -> {
+            ApiClient.ApiResult result = ApiClient.ping();
+            runOnUiThread(() -> {
+                status.setText((result.success ? "Conexión correcta\n" : "Conexión fallida\n") + result.message);
+            });
+        }, "api-ping").start();
+    }
+
+    private void refreshStatus() {
+        CallDatabase db = new CallDatabase(this);
+        boolean enabled = prefs.getBoolean(AppConfig.KEY_ENABLED, false);
+        toggleButton.setText(enabled ? "Desactivar registro automático" : "Activar registro automático");
+        status.setText(
+                "Estado: " + (enabled ? "ACTIVO" : "INACTIVO") +
+                "\nRegistros locales: " + db.totalCount() +
+                "\nPendientes de sincronización: " + db.pendingCount() +
+                "\nEndpoint: " + AppConfig.API_URL);
+    }
+
+    private void loadValues() {
+        userId.setText(prefs.getString(AppConfig.KEY_USER_ID, ""));
+        userName.setText(prefs.getString(AppConfig.KEY_USER_NAME, ""));
+        phone.setText(prefs.getString(AppConfig.KEY_PENDING_NUMBER, ""));
+        orderId.setText(prefs.getString(AppConfig.KEY_PENDING_ORDER, ""));
+    }
+
+    private boolean hasRequiredPermissions() {
+        if (Build.VERSION.SDK_INT < 23) return true;
+        return checkSelfPermission(Manifest.permission.READ_CALL_LOG) == PackageManager.PERMISSION_GRANTED &&
+                checkSelfPermission(Manifest.permission.READ_PHONE_STATE) == PackageManager.PERMISSION_GRANTED &&
+                hasLocationPermission();
+    }
+
+    private boolean hasLocationPermission() {
+        return Build.VERSION.SDK_INT < 23 ||
+                checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED ||
+                checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED;
+    }
+
+    private void requestRequiredPermissions() {
+        if (Build.VERSION.SDK_INT < 23) return;
+        List<String> permissions = new ArrayList<>();
+        permissions.add(Manifest.permission.READ_CALL_LOG);
+        permissions.add(Manifest.permission.READ_PHONE_STATE);
+        permissions.add(Manifest.permission.ACCESS_FINE_LOCATION);
+        if (Build.VERSION.SDK_INT >= 33) permissions.add(Manifest.permission.POST_NOTIFICATIONS);
+        requestPermissions(permissions.toArray(new String[0]), REQ_PERMISSIONS);
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode == REQ_PERMISSIONS && enableAfterPermission) {
+            enableAfterPermission = false;
+            if (hasRequiredPermissions()) enableMonitoring();
+            else toast("Sin permiso de historial, teléfono y ubicación la función automática no puede operar.");
+        }
+    }
+
+    private void startVisibleLocationService() {
+        Intent intent = new Intent(this, LocationTrackingService.class);
+        if (Build.VERSION.SDK_INT >= 26) startForegroundService(intent); else startService(intent);
+    }
+
+    private void openAppSettings() {
+        Intent intent = new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                Uri.parse("package:" + getPackageName()));
+        startActivity(intent);
+    }
+
+    private TextView label(String value) {
+        TextView view = text(value, 17, true);
+        view.setPadding(0, dp(14), 0, dp(6));
+        return view;
+    }
+
+    private TextView text(String value, int size, boolean bold) {
+        TextView view = new TextView(this);
+        view.setText(value);
+        view.setTextSize(size);
+        if (bold) view.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+        return view;
+    }
+
+    private EditText field(String hint, boolean phoneInput) {
+        EditText edit = new EditText(this);
+        edit.setHint(hint);
+        edit.setSingleLine(true);
+        edit.setInputType(phoneInput ? InputType.TYPE_CLASS_PHONE : InputType.TYPE_CLASS_TEXT);
+        edit.setPadding(dp(12), dp(10), dp(12), dp(10));
+        edit.setLayoutParams(new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+        return edit;
+    }
+
+    private Button button(String label) {
+        Button button = new Button(this);
+        button.setText(label);
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        params.topMargin = dp(8);
+        button.setLayoutParams(params);
+        return button;
+    }
+
+    private int dp(int value) {
+        return Math.round(value * getResources().getDisplayMetrics().density);
+    }
+
+    private void toast(String value) {
+        Toast.makeText(this, value, Toast.LENGTH_LONG).show();
+    }
+}

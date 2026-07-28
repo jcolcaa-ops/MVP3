@@ -1,0 +1,112 @@
+package com.jorge.registrollamadas;
+
+import android.content.ContentValues;
+import android.content.Context;
+import android.database.Cursor;
+import android.database.sqlite.SQLiteDatabase;
+import android.database.sqlite.SQLiteOpenHelper;
+
+import java.util.ArrayList;
+import java.util.List;
+
+public class CallDatabase extends SQLiteOpenHelper {
+    private static final String DB_NAME = "registro_llamadas.db";
+    private static final int DB_VERSION = 1;
+
+    public CallDatabase(Context context) {
+        super(context, DB_NAME, null, DB_VERSION);
+    }
+
+    @Override
+    public void onCreate(SQLiteDatabase db) {
+        db.execSQL("CREATE TABLE call_logs (" +
+                "id TEXT PRIMARY KEY," +
+                "phone TEXT NOT NULL," +
+                "call_day TEXT NOT NULL," +
+                "call_time INTEGER NOT NULL," +
+                "payload TEXT NOT NULL," +
+                "synced INTEGER NOT NULL DEFAULT 0," +
+                "error TEXT NOT NULL DEFAULT ''" +
+                ")");
+        db.execSQL("CREATE INDEX idx_call_pending ON call_logs(synced, call_time)");
+        db.execSQL("CREATE INDEX idx_call_attempt ON call_logs(phone, call_day)");
+    }
+
+    @Override
+    public void onUpgrade(SQLiteDatabase db, int oldVersion, int newVersion) {
+        db.execSQL("DROP TABLE IF EXISTS call_logs");
+        onCreate(db);
+    }
+
+    public boolean exists(String id) {
+        try (Cursor c = getReadableDatabase().rawQuery(
+                "SELECT 1 FROM call_logs WHERE id=? LIMIT 1", new String[]{id})) {
+            return c.moveToFirst();
+        }
+    }
+
+    public int countAttempts(String phone, String day) {
+        try (Cursor c = getReadableDatabase().rawQuery(
+                "SELECT COUNT(*) FROM call_logs WHERE phone=? AND call_day=?",
+                new String[]{phone, day})) {
+            return c.moveToFirst() ? c.getInt(0) : 0;
+        }
+    }
+
+    public boolean insert(String id, String phone, String day, long callTime, String payload) {
+        ContentValues values = new ContentValues();
+        values.put("id", id);
+        values.put("phone", phone);
+        values.put("call_day", day);
+        values.put("call_time", callTime);
+        values.put("payload", payload);
+        values.put("synced", 0);
+        values.put("error", "");
+        return getWritableDatabase().insertWithOnConflict(
+                "call_logs", null, values, SQLiteDatabase.CONFLICT_IGNORE) != -1;
+    }
+
+    public List<PendingRecord> pending() {
+        List<PendingRecord> rows = new ArrayList<>();
+        try (Cursor c = getReadableDatabase().rawQuery(
+                "SELECT id,payload FROM call_logs WHERE synced=0 ORDER BY call_time ASC", null)) {
+            while (c.moveToNext()) rows.add(new PendingRecord(c.getString(0), c.getString(1)));
+        }
+        return rows;
+    }
+
+    public void markSynced(String id) {
+        ContentValues values = new ContentValues();
+        values.put("synced", 1);
+        values.put("error", "");
+        getWritableDatabase().update("call_logs", values, "id=?", new String[]{id});
+    }
+
+    public void markError(String id, String error) {
+        ContentValues values = new ContentValues();
+        values.put("synced", 0);
+        values.put("error", error == null ? "Error desconocido" : error);
+        getWritableDatabase().update("call_logs", values, "id=?", new String[]{id});
+    }
+
+    public int totalCount() {
+        try (Cursor c = getReadableDatabase().rawQuery("SELECT COUNT(*) FROM call_logs", null)) {
+            return c.moveToFirst() ? c.getInt(0) : 0;
+        }
+    }
+
+    public int pendingCount() {
+        try (Cursor c = getReadableDatabase().rawQuery("SELECT COUNT(*) FROM call_logs WHERE synced=0", null)) {
+            return c.moveToFirst() ? c.getInt(0) : 0;
+        }
+    }
+
+    public static final class PendingRecord {
+        public final String id;
+        public final String payload;
+        public PendingRecord(String id, String payload) {
+            this.id = id;
+            this.payload = payload;
+        }
+    }
+}
